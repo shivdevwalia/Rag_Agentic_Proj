@@ -1,5 +1,28 @@
 # Agentic RAG local setup
 
+## Hybrid retrieval experiment
+
+Run `python scripts/ingestion.py --query "Why do chunks overlap?"` to load,
+chunk, embed, and search the sample corpus using dense search, BM25, and RRF.
+Use `--documents PATH` to select another corpus. Blank queries and empty corpora
+are rejected. Unreadable documents stop the run with their path; AGENTS.md files
+are excluded. BM25 contributes only chunks with matching query tokens.
+
+Importing the module does not load the embedding model. Model creation happens
+only when running the command. Each run still rebuilds embeddings and BM25 in
+memory; PostgreSQL persistence and incremental ingestion are not implemented.
+Chunks carry content/source/position hashes as metadata, but printed numeric IDs
+remain positions local to one run. Repeated identical inputs retain hash IDs;
+editing a document may change them and will require stale-record cleanup when
+persistence is added.
+
+Results are ranked candidates, not verified answers. An unrelated query may
+still receive dense results; no unvalidated relevance threshold is imposed.
+Before embedding, chunks are checked against the model token limit so oversized
+inputs fail clearly instead of being silently truncated.
+
+Run regression checks with `python -m unittest scripts.test_ingestion`.
+
 Python 3.11 virtual environment: `.venv`.
 
 ```powershell

@@ -1,4 +1,6 @@
 from pathlib import Path
+import argparse
+import hashlib
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
 import re
@@ -6,10 +8,7 @@ from rank_bm25 import BM25Okapi
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DOCUMENTS_DIR = PROJECT_ROOT / "data" / "documents"
 
-model = SentenceTransformer(
-      "BAAI/bge-small-en-v1.5",
-      device="cpu",
-  )
+MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
 
 def load_markdown_files(directory: Path) -> list[dict]:
@@ -19,7 +18,12 @@ def load_markdown_files(directory: Path) -> list[dict]:
     documents = []
 
     for path in sorted(directory.rglob("*.md")):
-        text = path.read_text(encoding="utf-8")
+        if path.name.lower() == "agents.md":
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise ValueError(f"Cannot read document {path}: {exc}") from exc
 
         if not text.strip():
             continue
@@ -47,13 +51,25 @@ def chunk_documents(documents):
             metadatas=[{"source": document["source"]}],
         )
 
+        for position, chunk in enumerate(document_chunks):
+            identity = document["source"] + "\0" + str(position) + "\0" + chunk.page_content
+            chunk.metadata["chunk_id"] = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         chunks.extend(document_chunks)
 
     return chunks
 
-def embed_chunks(chunks):
-   
+def embed_chunks(chunks, model):
+    if not chunks:
+        raise ValueError("No nonempty document chunks were found.")
     texts = [chunk.page_content for chunk in chunks]
+
+    tokenized = model.tokenizer(texts, truncation=False)
+    for chunk, token_ids in zip(chunks, tokenized["input_ids"]):
+        if len(token_ids) > model.max_seq_length:
+            raise ValueError(
+                f"Chunk from {chunk.metadata['source']} exceeds the model's "
+                f"{model.max_seq_length}-token limit; reduce chunk_size."
+            )
 
     embeddings = model.encode(
         texts,
@@ -66,6 +82,12 @@ def embed_chunks(chunks):
     return embeddings
 
 def dense_search(query, model, embeddings, top_k=5):
+    if not query.strip():
+        raise ValueError("Query must not be blank.")
+    if top_k < 1:
+        raise ValueError("top_k must be positive.")
+    if len(embeddings) == 0:
+        return []
     query_vector = model.encode(
         "Represent this sentence for searching relevant passages: " + query,
         normalize_embeddings=True,
@@ -86,10 +108,21 @@ def tokenize(text):
 
 
 def bm25_search(query, index, top_k=5):
-    scores = index.get_scores(tokenize(query))
+    if not query.strip():
+        raise ValueError("Query must not be blank.")
+    if top_k < 1:
+        raise ValueError("top_k must be positive.")
+    query_tokens = tokenize(query)
+    matching_ids = [
+        chunk_id for chunk_id, counts in enumerate(index.doc_freqs)
+        if any(token in counts for token in query_tokens)
+    ]
+    if not matching_ids:
+        return []
+    scores = index.get_scores(query_tokens)
 
     ranked_ids = sorted(
-        range(len(scores)),
+        matching_ids,
         key=lambda chunk_id: scores[chunk_id],
         reverse=True,
     )
@@ -100,10 +133,16 @@ def bm25_search(query, index, top_k=5):
     ]
 
 def reciprocal_rank_fusion(*ranked_lists, k=60, top_k=5):
+    if k < 0 or top_k < 1:
+        raise ValueError("k must be nonnegative and top_k must be positive.")
     fused_scores = {}
 
     for results in ranked_lists:
+        seen = set()
         for rank, (chunk_id, _) in enumerate(results, start=1):
+            if chunk_id in seen:
+                continue
+            seen.add(chunk_id)
             contribution = 1 / (k + rank)
 
             fused_scores[chunk_id] = (
@@ -119,8 +158,14 @@ def reciprocal_rank_fusion(*ranked_lists, k=60, top_k=5):
     return ranked_results[:top_k]
 
 
-if __name__ == "__main__":
-    documents = load_markdown_files(DOCUMENTS_DIR)
+def main():
+    parser = argparse.ArgumentParser(description="In-memory hybrid retrieval experiment")
+    parser.add_argument("--documents", type=Path, default=DOCUMENTS_DIR)
+    parser.add_argument("--query", default="How does the database keep its data after stopping Docker?")
+    args = parser.parse_args()
+    if not args.query.strip():
+        parser.error("Query must not be blank.")
+    documents = load_markdown_files(args.documents)
 
     print(f"Loaded {len(documents)} documents")
 
@@ -128,6 +173,12 @@ if __name__ == "__main__":
         print(f"{document['source']}: {len(document['text'])} characters")
 
     chunks = chunk_documents(documents)
+    if not chunks:
+        raise ValueError("No nonempty document chunks were found.")
+    tokenized_chunks = [tokenize(chunk.page_content) for chunk in chunks]
+    if not any(tokenized_chunks):
+        raise ValueError("Corpus has no words for BM25 indexing.")
+    model = SentenceTransformer(MODEL_NAME, device="cpu")
 
     print(f"Created {len(chunks)} chunks")
 
@@ -136,16 +187,17 @@ if __name__ == "__main__":
         print("Characters:", len(chunk.page_content))
         print(chunk.page_content)
 
-    embeddings = embed_chunks(chunks)
+    embeddings = embed_chunks(chunks, model)
 
     print("Embedding shape:", embeddings.shape)
     print("First vector's first 5 values:", embeddings[0][:5])
 
-    assert len(embeddings) == len(chunks)
+    if embeddings.ndim != 2 or len(embeddings) != len(chunks):
+        raise ValueError("Embeddings must have one vector per chunk.")
 
-    query = "How does the database keep its data after stopping Docker?"
+    query = args.query
 
-        # Prepare BM25 using the same chunks as dense search.
+    # Prepare BM25 using the same chunks as dense search.
     tokenized_chunks = [
         tokenize(chunk.page_content)
         for chunk in chunks
@@ -186,3 +238,10 @@ if __name__ == "__main__":
         )
         print("Source:", chunk.metadata["source"])
         print(chunk.page_content)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError) as exc:
+        raise SystemExit(str(exc)) from exc
