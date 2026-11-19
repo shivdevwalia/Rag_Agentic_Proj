@@ -1,0 +1,9 @@
+langchain
+langgraph
+fastapi
+uvicorn[standard]
+pgvector
+psycopg[binary]
+sentence-transformers
+ragas
+rank-bm25
